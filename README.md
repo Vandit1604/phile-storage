@@ -1,5 +1,8 @@
 # 🗂️ Phile Storage
 
+![Screenshot From 2025-05-07 00-10-04](https://github.com/user-attachments/assets/d7fc1ecf-5a16-4bfe-874d-39699faaafa7)
+
+
 **Phile Storage** is a simple peer-to-peer distributed file sharing system built with Go and React. It enables decentralized file uploads, discovery, and downloads across multiple dynamically spawned peers — with a real-time dashboard.
 
 ---
