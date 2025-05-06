@@ -146,7 +146,7 @@ func (s *Server) DiscoverFileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := context.Background()
-	peers, err := s.metadataStore.GetFilePeers(ctx, filename)
+	peers, err := s.metadataStore.GetFilePeers(ctx, fmt.Sprintf("file:"+filename))
 	if err != nil || len(peers) == 0 {
 		http.Error(w, "File not found on any peer", http.StatusNotFound)
 		return
