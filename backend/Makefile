@@ -36,7 +36,7 @@ run: build
 	./bin/$(BINARY_NAME) -peers=$(PEER_COUNT)
 
 # Run with a specific number of peers (e.g., make run-peers PEER_COUNT=3)
-run-peers: build
+run-peers: build start-docker
 	@echo "🚀 Running application with $(PEER_COUNT) peers..."
 	./bin/$(BINARY_NAME) -peers=$(PEER_COUNT)
 

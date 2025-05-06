@@ -5,7 +5,19 @@ export default function PeerList() {
   const [peers, setPeers] = useState({})
 
   useEffect(() => {
-    getAllPeers().then(setPeers).catch(() => setPeers({}))
+    async function fetchPeers() {
+      try {
+        const data = await getAllPeers()
+        setPeers(data)
+      } catch {
+        setPeers({})
+      }
+    }
+
+    fetchPeers() // initial fetch
+    const interval = setInterval(fetchPeers, 5000) // refresh every 5s
+
+    return () => clearInterval(interval) // cleanup on unmount
   }, [])
 
   return (

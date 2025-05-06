@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -25,8 +26,8 @@ func NewMetadataStore(redisAddr string) *MetadataStore {
 
 // AddFile adds a file and associates it with a peer
 func (ms *MetadataStore) AddFile(ctx context.Context, filename, peerAddress string) error {
-	// ONLY store the IP:PORT string, not UUID
-	return ms.client.SAdd(ctx, filename, peerAddress).Err()
+	key := fmt.Sprintf("file:%s", filename)
+	return ms.client.SAdd(ctx, key, peerAddress).Err()
 }
 
 // GetFilePeers returns the peers that have reference filename
@@ -37,4 +38,22 @@ func (ms *MetadataStore) GetFilePeers(ctx context.Context, filename string) ([]s
 	}
 
 	return peers, nil
+}
+
+func (m *MetadataStore) ListAllFiles(ctx context.Context) (map[string][]string, error) {
+	keys, err := m.client.Keys(ctx, "file:*").Result()
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string][]string)
+	for _, key := range keys {
+		peers, err := m.client.SMembers(ctx, key).Result()
+		if err != nil {
+			continue
+		}
+		filename := strings.TrimPrefix(key, "file:")
+		result[filename] = peers
+	}
+	return result, nil
 }

@@ -133,7 +133,6 @@ func (s *Server) UploadFileHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	response := fmt.Sprintf("✅ File %s uploaded & registered under peer UUID: %s", header.Filename, s.peerUUID)
-	log.Printf(response)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(response))
 }
@@ -182,8 +181,9 @@ func (s *Server) Start(port string) {
 	mux.HandleFunc("/download", s.DownloadFileHandler)
 	mux.HandleFunc("/discover", s.DiscoverFileHandler)
 	mux.HandleFunc("/peers", s.GetPeersHandler)
+	mux.HandleFunc("/files", s.ListFilesHandler)
 
-	// 🔥 Wrap with CORS middleware
+	// Wrap with CORS middleware
 	handler := withCORS(mux)
 
 	log.Printf("🚀 API server running on port %s", port)
@@ -203,4 +203,16 @@ func withCORS(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) ListFilesHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := context.Background()
+	files, err := s.metadataStore.ListAllFiles(ctx)
+	if err != nil {
+		http.Error(w, "Failed to fetch files", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(files)
 }
