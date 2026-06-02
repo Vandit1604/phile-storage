@@ -1,4 +1,3 @@
-
 import { useEffect, useState } from 'react'
 
 export default function FileMap() {
@@ -8,45 +7,35 @@ export default function FileMap() {
     async function fetchFiles() {
       try {
         const res = await fetch('http://127.0.0.1:5001/files')
-        const data = await res.json()
-        setFiles(data)
+        setFiles(await res.json())
       } catch {
         setFiles({})
       }
     }
-
-    fetchFiles() // initial fetch
-    const interval = setInterval(fetchFiles, 5000) // auto-refresh every 5s
-    return () => clearInterval(interval) // cleanup on unmount
+    fetchFiles()
+    const interval = setInterval(fetchFiles, 5000)
+    return () => clearInterval(interval)
   }, [])
 
-  return (
-    <div className="flex flex-col items-center text-center space-y-4">
-      <div>
-        <h2 className="text-2xl font-semibold text-gray-900">📂 File Peer Map</h2>
-        <p className="text-sm text-gray-500 mt-1">Which peers have which files</p>
-      </div>
+  const entries = Object.entries(files)
 
-      {Object.keys(files).length === 0 ? (
-        <p className="text-sm text-gray-500 italic">No files found</p>
+  return (
+    <>
+      <p className="text-soft text-sm">Files this peer knows about.</p>
+
+      {entries.length === 0 ? (
+        <p className="text-dim text-sm italic">No files yet.</p>
       ) : (
-        <div className="w-full space-y-4">
-          {Object.entries(files).map(([filename, peers]) => (
-            <div
-              key={filename}
-              className="text-left bg-gray-50 border border-gray-200 rounded-md p-4"
-            >
-              <div className="font-medium text-gray-800">{filename}</div>
-              <ul className="list-disc ml-5 mt-1 text-sm text-gray-700">
-                {peers.map((peer, i) => (
-                  <li key={i}>{peer}</li>
-                ))}
-              </ul>
-            </div>
+        <ul className="flex flex-col gap-2">
+          {entries.map(([filename, entry]) => (
+            <li key={filename} className="row">
+              <div className="font-semibold text-[var(--color-lime)]">{filename}</div>
+              <div className="mono text-soft text-xs mt-1">{entry.cid}</div>
+              <div className="mono text-dim text-[11px] mt-0.5">{(entry.holders || []).join(', ')}</div>
+            </li>
           ))}
-        </div>
+        </ul>
       )}
-    </div>
+    </>
   )
 }
-
