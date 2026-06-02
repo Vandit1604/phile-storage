@@ -1,5 +1,8 @@
 bin/
 
+# Peer runtime state (blocks, identity keys, name index)
+data/
+
 # Logs
 logs
 *.log
