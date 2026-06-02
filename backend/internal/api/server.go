@@ -1,218 +1,231 @@
 package api
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
+	"time"
 
-	"github.com/Vandit1604/phile-storage/internal/etcd"
+	"github.com/Vandit1604/phile-storage/internal/config"
+	"github.com/Vandit1604/phile-storage/internal/content"
+	"github.com/Vandit1604/phile-storage/internal/p2p"
 	"github.com/Vandit1604/phile-storage/internal/storage"
+	"github.com/ipfs/go-cid"
 )
 
-// Server wraps the API server
+// providerLimit caps how many DHT providers we try before giving up.
+const providerLimit = 5
+
+// MetadataStore is the content index the server depends on. It is satisfied by
+// the Redis-backed store (centralized mode) or the libp2p-backed store
+// (decentralized mode).
+type MetadataStore interface {
+	AddHolder(ctx context.Context, c cid.Cid, peerAddress string) error
+	GetHolders(ctx context.Context, c cid.Cid) ([]string, error)
+	SetName(ctx context.Context, filename string, c cid.Cid) error
+	ResolveName(ctx context.Context, filename string) (cid.Cid, error)
+	ListAll(ctx context.Context) (map[string]storage.FileEntry, error)
+}
+
+// PeerSource lists the active peers — etcd in centralized mode, the libp2p
+// peerstore in decentralized mode.
+type PeerSource interface {
+	GetPeers(ctx context.Context) (map[string]string, error)
+}
+
 type Server struct {
 	fileStore     *storage.FileStore
-	metadataStore *storage.MetadataStore
-	peerRegistry  *etcd.PeerRegistry
+	metadataStore MetadataStore
+	peerRegistry  PeerSource
+	node          *p2p.Node
+	cfg           config.Config
+	httpClient    *http.Client
 	peerAddress   string
 	peerUUID      string
 }
 
-// NewServer initializes the API server
-func NewServer(fileStore *storage.FileStore, metadataStore *storage.MetadataStore, peerRegistry *etcd.PeerRegistry, peerUUID, peerAddress string) *Server {
+func NewServer(
+	fileStore *storage.FileStore,
+	metadataStore MetadataStore,
+	peerRegistry PeerSource,
+	node *p2p.Node,
+	cfg config.Config,
+	peerUUID, peerAddress string,
+) *Server {
 	return &Server{
 		fileStore:     fileStore,
 		metadataStore: metadataStore,
 		peerRegistry:  peerRegistry,
+		node:          node,
+		cfg:           cfg,
+		httpClient:    &http.Client{Timeout: 30 * time.Second},
 		peerUUID:      peerUUID,
 		peerAddress:   peerAddress,
 	}
 }
 
-func (s *Server) DownloadFileHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-		return
-	}
-
-	filename := r.URL.Query().Get("filename")
-	if filename == "" {
-		http.Error(w, "Filename is required", http.StatusBadRequest)
-		return
-	}
-
-	// Step 1: Check if the file exists locally
-	filePath, err := s.fileStore.GetFile(s.peerUUID, filename)
-	if err == nil {
-		log.Printf("✅ File %s found locally on %s", filename, s.peerUUID)
-		http.ServeFile(w, r, filePath)
-		return
-	}
-
-	log.Printf("⚠️ File %s not found locally on %s. Searching on other peers...", filename, s.peerUUID)
-
-	// Step 2: Query other peers for the file
-	ctx := context.Background()
-	peers, err := s.metadataStore.GetFilePeers(ctx, filename)
-	if err != nil || len(peers) == 0 {
-		log.Printf("❌ File %s not found on any peer", filename)
-		http.Error(w, "File not found on any peer", http.StatusNotFound)
-		return
-	}
-
-	// Step 3: Avoid infinite loops by keeping track of already-checked peers
-	checkedPeers := make(map[string]bool)
-	checkedPeers[s.peerUUID] = true // Mark this peer as checked
-
-	for _, peer := range peers {
-		if peer == s.peerUUID || checkedPeers[peer] {
-			continue // Skip self and already-checked peers
-		}
-
-		checkedPeers[peer] = true // Mark peer as checked
-		fileURL := fmt.Sprintf("http://%s/download?filename=%s", peer, filename)
-		log.Printf("📡 Requesting file %s from peer %s", filename, peer)
-
-		resp, err := http.Get(fileURL)
-		if err != nil || resp.StatusCode != http.StatusOK {
-			log.Printf("❌ Failed to fetch %s from peer %s. Trying next peer...", filename, peer)
-			continue
-		}
-
-		// Step 4: Save the file locally
-		defer resp.Body.Close()
-		err = s.fileStore.SaveFile(s.peerUUID, filename, resp.Body)
-		if err != nil {
-			log.Printf("❌ Failed to save %s after fetching from peer %s", filename, peer)
-			http.Error(w, "Failed to save file", http.StatusInternalServerError)
-			return
-		}
-
-		// Step 5: Update Redis metadata
-		err = s.metadataStore.AddFile(ctx, filename, s.peerAddress)
-		if err != nil {
-			log.Printf("⚠️ Failed to update Redis metadata for %s", filename)
-		}
-
-		// Log success and serve the file
-		log.Printf("✅ Successfully fetched %s from peer %s and stored locally on %s", filename, peer, s.peerUUID)
-		filePath, _ = s.fileStore.GetFile(s.peerUUID, filename)
-		http.ServeFile(w, r, filePath)
-		return
-	}
-
-	// If no peer had the file, return an error
-	log.Printf("❌ File %s not available on any peer", filename)
-	http.Error(w, "File not found on any peer", http.StatusNotFound)
-}
-
-// UploadFileHandler (Now saves file under data/peerUUID/)
+// UploadFileHandler stores a file, indexes it by its CID, and announces it.
 func (s *Server) UploadFileHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadSize)
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		http.Error(w, "Failed to read file", http.StatusBadRequest)
+		http.Error(w, "failed to read file", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
-	// ✅ Save using peerUUID instead of peerAddress
-	err = s.fileStore.SaveFile(s.peerUUID, header.Filename, file)
+	c, data, err := content.ComputeReader(file)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to save file: %v", err), http.StatusInternalServerError)
+		http.Error(w, "failed to hash file", http.StatusInternalServerError)
 		return
 	}
 
-	// Register in Redis
-	ctx := context.Background()
-	err = s.metadataStore.AddFile(ctx, header.Filename, s.peerAddress)
-	if err != nil {
-		http.Error(w, "Failed to update metadata", http.StatusInternalServerError)
+	if err := s.fileStore.SaveBlock(c, bytes.NewReader(data)); err != nil {
+		http.Error(w, "failed to store file", http.StatusInternalServerError)
 		return
 	}
 
-	response := fmt.Sprintf("✅ File %s uploaded & registered under peer UUID: %s", header.Filename, s.peerUUID)
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(response))
+	ctx := r.Context()
+	if err := s.metadataStore.AddHolder(ctx, c, s.peerAddress); err != nil {
+		http.Error(w, "failed to index file", http.StatusInternalServerError)
+		return
+	}
+	if err := s.metadataStore.SetName(ctx, header.Filename, c); err != nil {
+		http.Error(w, "failed to register name", http.StatusInternalServerError)
+		return
+	}
+	s.announce(c)
+
+	slog.Info("file uploaded", "filename", header.Filename, "cid", c.String(), "peer", s.peerUUID)
+	writeJSON(w, http.StatusOK, map[string]string{"filename": header.Filename, "cid": c.String()})
 }
 
-// DiscoverFileHandler finds which peers have a given file
+// DownloadFileHandler serves a file by name or CID, fetching it from the
+// network (libp2p first, HTTP second) and verifying its hash before caching.
+func (s *Server) DownloadFileHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	ctx := r.Context()
+	c, filename, err := s.resolveTarget(ctx, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if !s.fileStore.HasBlock(c) {
+		if err := s.fetchAndCache(ctx, c); err != nil {
+			slog.Warn("download failed", "cid", c.String(), "err", err)
+			http.Error(w, "file not available on any peer", http.StatusNotFound)
+			return
+		}
+	}
+
+	path, err := s.fileStore.GetBlockPath(c)
+	if err != nil {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+	if filename != "" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
+	}
+	http.ServeFile(w, r, path)
+}
+
+// BlockHandler serves a local block by CID with no discovery or recursion.
+// Peers use it as the HTTP transport when fetching from each other.
+func (s *Server) BlockHandler(w http.ResponseWriter, r *http.Request) {
+	c, err := content.Parse(r.URL.Query().Get("cid"))
+	if err != nil {
+		http.Error(w, "valid cid required", http.StatusBadRequest)
+		return
+	}
+	path, err := s.fileStore.GetBlockPath(c)
+	if err != nil {
+		http.Error(w, "block not found", http.StatusNotFound)
+		return
+	}
+	http.ServeFile(w, r, path)
+}
+
+// DiscoverFileHandler reports the CID a name resolves to and who holds it.
 func (s *Server) DiscoverFileHandler(w http.ResponseWriter, r *http.Request) {
 	filename := r.URL.Query().Get("filename")
 	if filename == "" {
-		http.Error(w, "Filename is required", http.StatusBadRequest)
+		http.Error(w, "filename is required", http.StatusBadRequest)
 		return
 	}
-
-	ctx := context.Background()
-	peers, err := s.metadataStore.GetFilePeers(ctx, fmt.Sprintf("file:"+filename))
-	if err != nil || len(peers) == 0 {
-		http.Error(w, "File not found on any peer", http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(peers)
-}
-
-// GetPeersHandler returns the list of active peers
-func (s *Server) GetPeersHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Invalid Method", http.StatusMethodNotAllowed)
-	}
-
-	ctx := context.Background()
-
-	peers, err := s.peerRegistry.GetPeers(ctx)
+	ctx := r.Context()
+	c, err := s.metadataStore.ResolveName(ctx, filename)
 	if err != nil {
-		http.Error(w, "Failed to fetch peers", http.StatusInternalServerError)
+		http.Error(w, "file not found", http.StatusNotFound)
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(peers)
+	writeJSON(w, http.StatusOK, map[string]any{"cid": c.String(), "holders": s.holders(ctx, c)})
 }
 
-// Start initializes all API routes and starts the HTTP server
+func contains(list []string, v string) bool {
+	for _, item := range list {
+		if item == v {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) GetPeersHandler(w http.ResponseWriter, r *http.Request) {
+	peers, err := s.peerRegistry.GetPeers(r.Context())
+	if err != nil {
+		http.Error(w, "failed to fetch peers", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, peers)
+}
+
+func (s *Server) ListFilesHandler(w http.ResponseWriter, r *http.Request) {
+	files, err := s.metadataStore.ListAll(r.Context())
+	if err != nil {
+		http.Error(w, "failed to fetch files", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, files)
+}
+
+// P2PInfoHandler exposes this node's libp2p identity.
+func (s *Server) P2PInfoHandler(w http.ResponseWriter, r *http.Request) {
+	if s.node == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled": true,
+		"peerID":  s.node.ID(),
+		"addrs":   s.node.Addrs(),
+	})
+}
+
 func (s *Server) Start(port string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/upload", s.UploadFileHandler)
 	mux.HandleFunc("/download", s.DownloadFileHandler)
+	mux.HandleFunc("/block", s.BlockHandler)
 	mux.HandleFunc("/discover", s.DiscoverFileHandler)
+	mux.HandleFunc("/search", s.SearchHandler)
 	mux.HandleFunc("/peers", s.GetPeersHandler)
 	mux.HandleFunc("/files", s.ListFilesHandler)
+	mux.HandleFunc("/p2p/info", s.P2PInfoHandler)
 
-	// Wrap with CORS middleware
-	handler := withCORS(mux)
-
-	log.Printf("🚀 API server running on port %s", port)
-	log.Fatal(http.ListenAndServe(port, handler))
-}
-
-func withCORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*") // 🔥 allow all origins
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-func (s *Server) ListFilesHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := context.Background()
-	files, err := s.metadataStore.ListAllFiles(ctx)
-	if err != nil {
-		http.Error(w, "Failed to fetch files", http.StatusInternalServerError)
-		return
+	slog.Info("api server listening", "port", port, "peer", s.peerUUID)
+	if err := http.ListenAndServe(port, s.withCORS(mux)); err != nil {
+		slog.Error("api server stopped", "err", err)
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(files)
 }

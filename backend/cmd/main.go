@@ -1,62 +1,127 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/Vandit1604/phile-storage/internal/api"
+	"github.com/Vandit1604/phile-storage/internal/config"
+	"github.com/Vandit1604/phile-storage/internal/content"
 	"github.com/Vandit1604/phile-storage/internal/etcd"
+	"github.com/Vandit1604/phile-storage/internal/p2p"
 	"github.com/Vandit1604/phile-storage/internal/storage"
-	"github.com/google/uuid"
 )
 
-func startPeer(peerUUID, peerAddress string, peerRegistry *etcd.PeerRegistry, metadataStore *storage.MetadataStore) {
-	// Register peer using UUID
-	err := peerRegistry.RegisterPeerWithHeartbeat(peerUUID, peerAddress)
-	if err != nil {
-		log.Fatalf("❌ Failed to register peer: %v", err)
+// backend bundles the shared services a peer needs. In decentralized mode the
+// etcd/redis fields are nil and each peer builds its own libp2p-backed store.
+type backend struct {
+	cfg      config.Config
+	registry *etcd.PeerRegistry     // nil in decentralized mode
+	metadata *storage.MetadataStore // nil in decentralized mode
+}
+
+func startPeer(ctx context.Context, b backend, index int) {
+	cfg := b.cfg
+	httpPort := cfg.BasePort + index
+	libp2pPort := cfg.BasePort + p2p.PortOffset + index
+	// A stable, port-derived ID keeps each peer's data directory (blocks +
+	// identity key + name index) across restarts.
+	peerID := fmt.Sprintf("peer-%d", httpPort)
+	peerAddress := fmt.Sprintf("127.0.0.1:%d", httpPort)
+
+	fileStore := storage.NewFileStore(peerID)
+
+	// The libp2p host serves blocks it holds locally to peers asking by CID.
+	provide := func(cidStr string) ([]byte, error) {
+		c, err := content.Parse(cidStr)
+		if err != nil {
+			return nil, err
+		}
+		return fileStore.ReadBlock(c)
 	}
 
-	// Initialize file storage (Unique per peer)
-	fileStore := storage.NewFileStore(peerUUID)
+	node, err := p2p.NewNode(ctx, peerID, libp2pPort, provide)
+	if err != nil {
+		slog.Error("libp2p is required but failed to start", "peer", peerID, "err", err)
+		return
+	}
 
-	// Initialize API server
-	server := api.NewServer(fileStore, metadataStore, peerRegistry, peerUUID, peerAddress)
+	var meta api.MetadataStore
+	var peers api.PeerSource
+	if cfg.UseEtcdRedis {
+		if err := b.registry.RegisterPeerWithHeartbeat(peerID, peerAddress); err != nil {
+			slog.Error("register peer", "peer", peerID, "err", err)
+			return
+		}
+		meta, peers = b.metadata, b.registry
+	} else {
+		namesPath := filepath.Join("data", peerID, "names.json")
+		store := p2p.NewStore(node, peerAddress, namesPath)
+		meta, peers = store, store
+	}
 
-	// Start server in a separate routine
-	go server.Start(peerAddress[9:]) // Extracts port from "127.0.0.1:500X"
+	// Re-announce blocks already on disk so persisted content is discoverable
+	// again after a restart.
+	go reannounce(ctx, node, fileStore)
 
-	log.Printf("🚀 Peer %s running at %s (UUID: %s)", peerAddress, peerAddress, peerUUID)
+	server := api.NewServer(fileStore, meta, peers, node, cfg, peerID, peerAddress)
+	go server.Start(fmt.Sprintf(":%d", httpPort))
+
+	slog.Info("peer running", "http", peerAddress, "id", peerID, "mode", mode(cfg))
+}
+
+// reannounce tells the DHT about every block this peer already holds on disk.
+func reannounce(ctx context.Context, node *p2p.Node, fileStore *storage.FileStore) {
+	cids, err := fileStore.ListBlockCIDs()
+	if err != nil || len(cids) == 0 {
+		return
+	}
+	for _, c := range cids {
+		annCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		_ = node.Provide(annCtx, c)
+		cancel()
+	}
+	slog.Info("re-announced persisted blocks", "count", len(cids))
+}
+
+func mode(cfg config.Config) string {
+	if cfg.UseEtcdRedis {
+		return "centralized (etcd+redis)"
+	}
+	return "decentralized (libp2p)"
 }
 
 func main() {
-	// Command-line flag to specify number of peers
-	numPeers := flag.Int("peers", 1, "Number of peer nodes to start")
+	numPeers := flag.Int("peers", 1, "number of peer nodes to start")
 	flag.Parse()
 
-	// ✅ Initialize Etcd and Redis **once** and share across all peers
-	etcdEndpoints := []string{"localhost:2379"}
-	client, err := etcd.NewEtcdClient(etcdEndpoints)
-	if err != nil {
-		log.Fatalf("❌ Failed to connect to Etcd: %v", err)
+	cfg := config.Load()
+	ctx := context.Background()
+	b := backend{cfg: cfg}
+
+	// Only stand up etcd + Redis when explicitly enabled. The default path
+	// needs no external infrastructure.
+	if cfg.UseEtcdRedis {
+		client, err := etcd.NewEtcdClient(cfg.EtcdEndpoints)
+		if err != nil {
+			slog.Error("connect etcd", "err", err)
+			os.Exit(1)
+		}
+		defer client.Close()
+		b.registry = etcd.NewPeerRegistry(client, 10)
+		b.metadata = storage.NewMetadataStore(cfg.RedisAddr)
 	}
-	defer client.Close()
+	slog.Info("starting phile-storage", "mode", mode(cfg), "peers", *numPeers)
 
-	peerRegistry := etcd.NewPeerRegistry(client, 10)
-	metadataStore := storage.NewMetadataStore("localhost:6379")
-
-	// ✅ Start each peer and pass shared `peerRegistry` and `metadataStore`
 	for i := 0; i < *numPeers; i++ {
-		port := 5001 + i
-		peerUUID := uuid.New().String()
-		peerAddress := fmt.Sprintf("127.0.0.1:%d", port)
-
-		go startPeer(peerUUID, peerAddress, peerRegistry, metadataStore) // Pass shared instances
-
+		go startPeer(ctx, b, i)
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	select {} // Keep the main process running
+	select {}
 }

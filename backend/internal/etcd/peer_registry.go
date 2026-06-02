@@ -48,38 +48,32 @@ func (pr *PeerRegistry) RegisterPeerWithHeartbeat(peerID, address string) error 
 		return fmt.Errorf("failed to start keep-alive: %v", err)
 	}
 
-	// Start a goroutine to handle lease keep-alive responses
+	// Start a goroutine to handle lease keep-alive responses. When the channel
+	// closes the lease was lost, so re-register and resume monitoring.
 	go func() {
 		for {
-			select {
-			case kaResp, ok := <-keepAliveChan:
-				if !ok {
-					log.Printf("⚠️ KeepAlive channel closed for peer %s. Retrying registration...", peerID)
-
-					// Re-register on failure
-					lease, err = pr.client.client.Grant(ctx, pr.ttl)
-					if err != nil {
-						log.Printf("❌ Failed to create new lease for %s: %v", peerID, err)
-						return
-					}
-
-					_, err = pr.client.client.Put(ctx, key, address, clientv3.WithLease(lease.ID))
-					if err != nil {
-						log.Printf("❌ Failed to re-register peer %s: %v", peerID, err)
-						return
-					}
-
-					keepAliveChan, err = pr.client.client.KeepAlive(context.Background(), lease.ID)
-					if err != nil {
-						log.Printf("❌ Failed to restart KeepAlive for peer %s: %v", peerID, err)
-						return
-					}
-
-					log.Printf("✅ Peer %s successfully re-registered after KeepAlive failure", peerID)
-				} else if kaResp == nil {
+			for kaResp := range keepAliveChan {
+				if kaResp == nil {
 					log.Printf("⚠️ Received nil KeepAlive response for peer %s. Checking lease status...", peerID)
 				}
 			}
+
+			log.Printf("⚠️ KeepAlive channel closed for peer %s. Retrying registration...", peerID)
+			lease, err = pr.client.client.Grant(ctx, pr.ttl)
+			if err != nil {
+				log.Printf("❌ Failed to create new lease for %s: %v", peerID, err)
+				return
+			}
+			if _, err = pr.client.client.Put(ctx, key, address, clientv3.WithLease(lease.ID)); err != nil {
+				log.Printf("❌ Failed to re-register peer %s: %v", peerID, err)
+				return
+			}
+			keepAliveChan, err = pr.client.client.KeepAlive(context.Background(), lease.ID)
+			if err != nil {
+				log.Printf("❌ Failed to restart KeepAlive for peer %s: %v", peerID, err)
+				return
+			}
+			log.Printf("✅ Peer %s successfully re-registered after KeepAlive failure", peerID)
 		}
 	}()
 
@@ -95,7 +89,7 @@ func (pr *PeerRegistry) GetPeers(ctx context.Context) (map[string]string, error)
 
 	peers := make(map[string]string)
 	if resp.Count == 0 {
-		return nil, errors.New("No Peer in etcd")
+		return nil, errors.New("no peers registered in etcd")
 	}
 
 	for _, kv := range resp.Kvs {
